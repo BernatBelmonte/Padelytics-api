@@ -210,7 +210,7 @@ def get_tournaments(
         .gte("start_date", f"{year}-01-01") \
         .lte("start_date", f"{year}-12-31")
     if tournament_id is not None:
-        query = query.eq("tournaments_id", tournament_id)
+        query = query.eq("id", tournament_id)
     res = query.order("start_date", desc=False).execute()
     return res.data
 
@@ -226,5 +226,5 @@ def global_search(q: str):
         label = pair["pair_slug"].replace("--", " / ").replace("-", " ").title()
         results.append({"type": "pair_slug", "slug": pair["pair_slug"], "label": label})
     for t in supabase.table("tournaments").select("*").ilike("full_name", f"%{q}%").limit(3).execute().data:
-        results.append({"type": "tournament", "id": str(t["tournaments_id"]), "label": t["full_name"]})
+        results.append({"type": "tournament", "id": str(t["id"]), "label": t["full_name"]})
     return results
