@@ -206,11 +206,14 @@ def get_tournaments(
     year: int = Query(2025, description="Filter tournaments by year"),
     tournament_id: Optional[int] = Query(None, description="Filter by specific tournament id")
 ):
-    query = supabase.table("tournaments").select("*") \
-        .gte("start_date", f"{year}-01-01") \
-        .lte("start_date", f"{year}-12-31")
+    query = supabase.table("tournaments").select("*")
+    
     if tournament_id is not None:
         query = query.eq("id", tournament_id)
+    else:
+        query = query.gte("start_date", f"{year}-01-01") \
+                     .lte("start_date", f"{year}-12-31")
+                     
     res = query.order("start_date", desc=False).execute()
     return res.data
 
