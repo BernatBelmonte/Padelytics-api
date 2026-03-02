@@ -12,14 +12,14 @@ url: str = os.getenv("SUPABASE_URL")
 key: str = os.getenv("SUPABASE_KEY")
 
 if not url or not key:
-    raise ValueError("❌ SUPABASE_URL and SUPABASE_KEY must be set in .env file")
+    raise ValueError(" SUPABASE_URL and SUPABASE_KEY must be set in .env file")
 
 supabase: Client = create_client(url, key)
 
 app = FastAPI(
-    title="VoleAI API - Padel Pro Analytics",
+    title="Padelytics API Padel Pro Analytics",
     description="Advanced API for accessing professional padel data from Premier Padel.",
-    version="1.1.0"
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -30,55 +30,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Pydantic Models ────────────────────────────────────────────────────────
-
-class PlayerStats(BaseModel):
-    slug: str
-    name: str
-    points: int
-    rank: int
-    partner: Optional[str] = None
-
-class MatchSchema(BaseModel):
-    date: date
-    round_name: str
-    winner_team: int
-    score: Optional[str] = None
-    team1_slug: str
-    team2_slug: str
-
 # ─── General ────────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["General"])
 def home():
-    return {"message": "VoleAI API 🎾", "docs": "/docs"}
+    return {"message": "Padelytics API 🎾", "docs": "/docs"}
 
 # ─── Players ────────────────────────────────────────────────────────────────
-#
-# ORDER MATTERS: specific routes must come before generic /{slug} catch-all.
-#
-#   /players/ranking                          → 2 fixed segments
-#   /players/headtohead/{player1}/{player2}   → 4 segments, before /{slug}
-#   /players/{slug}/evolution                 → 3 segments, before /{slug}
-#   /players/{slug}                           → 2 segments, LAST (catch-all)
+# /players                                  - list with search
+# /players/{slug}                           - profile + evolution
+# /players/ranking                          - official ranking (latest snapshot)
+# /players/headtohead?player1=&player2=     - compare 2 players (latest snapshot)
 
 @app.get("/players", tags=["Players"])
 def get_players(skip: int = 0, limit: int = 20, search: Optional[str] = None):
-    """List all players from the static players table. Supports name search."""
+    """Returns a list of players. Supports name search."""
     query = supabase.table("players").select("*")
     if search:
         query = query.ilike("name", f"%{search}%")
     res = query.range(skip, skip + limit - 1).execute()
     return res.data
 
-
 @app.get("/players/ranking", tags=["Players"])
 def get_players_ranking(limit: int = 50):
-    """Official ranking from dynamic_players (latest snapshot, ordered by points)."""
+    """Returns latest ranking snapshot ordered by points descending."""
     latest = supabase.table("dynamic_players") \
         .select("snapshot_date").order("snapshot_date", desc=True).limit(1).execute()
     if not latest.data:
-        return []
+        raise HTTPException(404, detail="No ranking data available")
     latest_date = latest.data[0]["snapshot_date"]
     res = supabase.table("dynamic_players") \
         .select("*, players(*)") \
@@ -88,13 +67,9 @@ def get_players_ranking(limit: int = 50):
         .execute()
     return res.data
 
-
-@app.get("/players/headtohead/{player1}/{player2}", tags=["Players"])
-def get_players_head_to_head(player1: str, player2: str):
-    """
-    Compare two players using their latest dynamic_players stats.
-    NOTE: defined before /players/{slug} to avoid route shadowing.
-    """
+@app.get("/players/head-to-head", tags=["Players"])
+def get_players_head_to_head(player1: str = Query(...), player2: str = Query(...)):
+    """Compare two players using their latest stats. Returns both profiles and the date of the snapshot used for comparison."""
     p1_res = supabase.table("dynamic_players") \
         .select("*, players(*)") \
         .eq("slug", player1) \
@@ -112,51 +87,37 @@ def get_players_head_to_head(player1: str, player2: str):
     return {"player1": p1_res.data[0], "player2": p2_res.data[0]}
 
 
-@app.get("/players/{slug}/evolution", tags=["Players"])
-def get_player_evolution(slug: str):
-    """
-    Point/ranking history for a player.
-    NOTE: defined before /players/{slug} to avoid route shadowing.
-    """
-    check = supabase.table("players").select("slug").eq("slug", slug).execute()
-    if not check.data:
-        raise HTTPException(404, detail="Player not found")
-    res = supabase.table("dynamic_players") \
-        .select("*").eq("slug", slug).order("snapshot_date", desc=False).execute()
-    return res.data
-
-
 @app.get("/players/{slug}", tags=["Players"])
-def get_player_profile(slug: str):
-    """Static profile + latest dynamic stats. LAST player route (catch-all)."""
+def get_player_profile(slug: str, history: int = Query(10, description="Include evolution history over time")):
+    """Static profile + evolution."""
     player = supabase.table("players").select("*").eq("slug", slug).execute()
     if not player.data:
         raise HTTPException(404, detail="Player not found")
     stats = supabase.table("dynamic_players") \
-        .select("*").eq("slug", slug).order("snapshot_date", desc=True).limit(1).execute()
+        .select("*").eq("slug", slug).order("snapshot_date", desc=True).limit(history).execute()
     return {
         "profile": player.data[0],
-        "current_stats": stats.data[0] if stats.data else None
+        "history": stats.data if stats.data else None
     }
 
 # ─── Pairs ──────────────────────────────────────────────────────────────────
-#
-# Pair slugs use '--' (double dash) as separator and NEVER contain '/'.
-# Therefore we use plain {pair_slug} (single-segment) instead of {slug:path},
-# which eliminates all catch-all conflicts.
-#
-# ORDER:
-#   /pairs/head-to-head       → query params, fixed path, FIRST
-#   /pairs/{pair_slug}/evolution → 3 segments, before /{pair_slug}
-#   /pairs/{pair_slug}        → 2 segments, LAST (catch-all)
 
 @app.get("/pairs", tags=["Pairs"])
-def get_pairs_ranking(limit: int = 20):
-    """Pair ranking from dynamic_pairs (latest snapshot)."""
+def get_pairs(skip: int = 0, limit: int = 20, search: Optional[str] = None):
+    """Returns a list of pairs. Supports pair_slug search."""
+    query = supabase.table("dynamic_pairs").select("*")
+    if search:
+        query = query.ilike("pair_slug", f"%{search}%")
+    res = query.range(skip, skip + limit - 1).execute()
+    return res.data
+
+@app.get("/pairs/ranking", tags=["Pairs"])
+def get_pairs_ranking(limit: int = 50):
+    """Returns latest ranking snapshot ordered by points descending."""
     latest = supabase.table("dynamic_pairs") \
         .select("snapshot_date").order("snapshot_date", desc=True).limit(1).execute()
     if not latest.data:
-        return []
+        raise HTTPException(404, detail="No pairs data available")
     latest_date = latest.data[0]["snapshot_date"]
     res = supabase.table("dynamic_pairs") \
         .select("*, player1:players!player1_slug(*), player2:players!player2_slug(*)") \
@@ -165,13 +126,10 @@ def get_pairs_ranking(limit: int = 20):
         .limit(limit).execute()
     return res.data
 
-
 @app.get("/pairs/head-to-head", tags=["Pairs"])
 def get_pairs_head_to_head(slug1: str = Query(...), slug2: str = Query(...)):
     """
-    Compare two pairs via dynamic_pairs stats.
-    Uses query params (?slug1=&slug2=) to avoid conflicting with /{pair_slug}.
-    NOTE: defined before /pairs/{pair_slug} to avoid route shadowing.
+    Compare two pairs using their latest stats. Returns both profiles and the date of the snapshot used for comparison.
     """
     p1_res = supabase.table("dynamic_pairs") \
         .select("*, player1:players!player1_slug(*), player2:players!player2_slug(*)") \
@@ -186,57 +144,43 @@ def get_pairs_head_to_head(slug1: str = Query(...), slug2: str = Query(...)):
     if not p2_res.data:
         raise HTTPException(404, detail=f"Pair '{slug2}' not found")
     return {
-        "snapshot_date": p1_res.data[0].get("snapshot_date"),
         "pair1": p1_res.data[0],
         "pair2": p2_res.data[0]
     }
 
-
-@app.get("/pairs/{pair_slug}/evolution", tags=["Pairs"])
-def get_pair_evolution(pair_slug: str):
-    """
-    Point/ranking history for a pair.
-    NOTE: defined before /pairs/{pair_slug} to avoid route shadowing.
-    """
-    res = supabase.table("dynamic_pairs") \
-        .select("*").eq("pair_slug", pair_slug).order("snapshot_date", desc=False).execute()
-    return res.data
-
-
 @app.get("/pairs/{pair_slug}", tags=["Pairs"])
-def get_pair_profile(pair_slug: str):
-    """Pair profile from dynamic_pairs (latest snapshot). LAST pair route (catch-all)."""
-    latest = supabase.table("dynamic_pairs") \
-        .select("snapshot_date").order("snapshot_date", desc=True).limit(1).execute()
-    if not latest.data:
-        raise HTTPException(404, detail="No pairs data")
-    latest_date = latest.data[0]["snapshot_date"]
-    res = supabase.table("dynamic_pairs") \
-        .select("*, player1:players!player1_slug(*), player2:players!player2_slug(*)") \
-        .eq("pair_slug", pair_slug).eq("snapshot_date", latest_date).execute()
-    if not res.data:
+def get_pair_profile(pair_slug: str, history: int = Query(10, description="Include evolution history over time")):
+    """Pair profile + evolution."""
+    pair = supabase.table("dynamic_pairs").select("*").eq("pair_slug", pair_slug).execute()
+    if not pair.data:
         raise HTTPException(404, detail="Pair not found")
-    return res.data[0]
+    stats = supabase.table("dynamic_pairs") \
+        .select("*").eq("pair_slug", pair_slug).order("snapshot_date", desc=True).limit(history).execute()
+    return {
+        "profile": pair.data[0],
+        "history": stats.data if stats.data else None
+    }
 
 # ─── Matches ────────────────────────────────────────────────────────────────
-#
-# Pair slugs don't contain '/', so plain {pair1}/{pair2} works fine.
-# No :path modifier needed.
 
 @app.get("/matches", tags=["Matches"])
-def get_matches(limit: int = 20, tournament_id: Optional[int] = None, date_from: Optional[date] = None):
-    """List matches with optional filters."""
+def get_matches(
+    limit: int = Query(20, ge=1, le=200, description="Maximum number of matches to return"),
+    tournament_id: Optional[int] = Query(None, description="Filter by tournament id"),
+    date_from: Optional[date] = Query(None, description="Filter matches from this date (YYYY-MM-DD)")
+):
+    """List matches with optional filters and pagination."""
     query = supabase.table("matches").select("*").order("date", desc=True)
-    if tournament_id:
+    if tournament_id is not None:
         query = query.eq("tournament_id", tournament_id)
-    if date_from:
+    if date_from is not None:
         query = query.gte("date", date_from)
     return query.limit(limit).execute().data
 
 
-@app.get("/matches/{pair1}/{pair2}", tags=["Matches"])
-def get_matches_head_to_head(pair1: str, pair2: str):
-    """Match history between two pairs/teams."""
+@app.get("/matches/head-to-head", tags=["Matches"])
+def get_matches_head_to_head(pair1: str = Query(...), pair2: str = Query(...)):
+    """Match history between two pairs/teams, using query params (?pair1=&pair2=)."""
     slugs = f"({pair1},{pair2})"
     res = supabase.table("matches") \
         .select("*") \
@@ -258,29 +202,19 @@ def get_matches_head_to_head(pair1: str, pair2: str):
 # ─── Tournaments ────────────────────────────────────────────────────────────
 
 @app.get("/tournaments", tags=["Tournaments"])
-def get_tournaments(year: int = 2025):
-    res = supabase.table("tournaments") \
-        .select("*") \
+def get_tournaments(
+    year: int = Query(2025, description="Filter tournaments by year"),
+    tournament_id: Optional[int] = Query(None, description="Filter by specific tournament id")
+):
+    query = supabase.table("tournaments").select("*") \
         .gte("start_date", f"{year}-01-01") \
-        .lte("start_date", f"{year}-12-31") \
-        .order("start_date", desc=False).execute()
+        .lte("start_date", f"{year}-12-31")
+    if tournament_id is not None:
+        query = query.eq("tournaments_id", tournament_id)
+    res = query.order("start_date", desc=False).execute()
     return res.data
 
 # ─── Analytics ──────────────────────────────────────────────────────────────
-
-@app.get("/analytics/trending", tags=["Analytics"])
-def get_trending_players():
-    """Top 10 players with biggest positive points change in the latest snapshot."""
-    latest = supabase.table("dynamic_players") \
-        .select("snapshot_date").order("snapshot_date", desc=True).limit(1).execute()
-    if not latest.data:
-        return []
-    target_date = latest.data[0]["snapshot_date"]
-    res = supabase.table("dynamic_players") \
-        .select("*").eq("snapshot_date", target_date) \
-        .gt("points_change", 0).order("points_change", desc=True).limit(10).execute()
-    return res.data
-
 
 @app.get("/search", tags=["Analytics"])
 def global_search(q: str):
