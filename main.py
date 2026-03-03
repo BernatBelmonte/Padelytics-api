@@ -120,7 +120,7 @@ def home(request: Request):
 def get_players(
     request: Request,
     skip: int = Query(0, ge=0, description="Number of records to skip (pagination)"),
-    limit: int = Query(20, ge=1, le=100, description="Maximum records to return (max 100)"),
+    limit: int = Query(20, ge=1, le=2000, description="Maximum records to return (max 2000)"),
     search: Optional[str] = Query(
         None,
         min_length=1,
@@ -141,7 +141,7 @@ def get_players(
 @limiter.limit(config.RATE_LIMIT_DEFAULT)
 def get_players_ranking(
     request: Request,
-    limit: int = Query(50, ge=1, le=200, description="Maximum players to return (max 200)"),
+    limit: int = Query(50, ge=1, le=2000, description="Maximum players to return (max 2000)"),
 ):
     """Returns the latest ranking snapshot ordered by points descending."""
     latest = (
@@ -213,7 +213,7 @@ def get_players_head_to_head(
 def get_player_profile(
     request: Request,
     slug: str = Path(..., min_length=1, max_length=100, description="Player slug"),
-    history: int = Query(10, ge=1, le=50, description="Snapshot history depth (max 50)"),
+    history: int = Query(10, ge=1, le=100, description="Snapshot history depth (max 100)"),
 ):
     """Static profile + evolution history for a single player."""
     # Extra server-side slug validation (defence-in-depth beyond Path constraints)
@@ -242,7 +242,7 @@ def get_player_profile(
 def get_pairs(
     request: Request,
     skip: int = Query(0, ge=0, description="Number of records to skip"),
-    limit: int = Query(20, ge=1, le=100, description="Maximum records to return (max 100)"),
+    limit: int = Query(20, ge=1, le=2000, description="Maximum records to return (max 2000)"),
     search: Optional[str] = Query(
         None,
         min_length=1,
@@ -262,7 +262,7 @@ def get_pairs(
 @limiter.limit(config.RATE_LIMIT_DEFAULT)
 def get_pairs_ranking(
     request: Request,
-    limit: int = Query(50, ge=1, le=200, description="Maximum pairs to return (max 200)"),
+    limit: int = Query(50, ge=1, le=2000, description="Maximum pairs to return (max 2000)"),
 ):
     """Returns the latest pairs ranking snapshot ordered by points descending."""
     latest = (
@@ -334,7 +334,7 @@ def get_pairs_head_to_head(
 def get_pair_profile(
     request: Request,
     pair_slug: str = Path(..., min_length=1, max_length=100, description="Pair slug"),
-    history: int = Query(10, ge=1, le=50, description="Snapshot history depth (max 50)"),
+    history: int = Query(10, ge=1, le=100, description="Snapshot history depth (max 100)"),
 ):
     """Pair profile + evolution history."""
     _validate_slug(pair_slug, "pair slug")
@@ -361,7 +361,7 @@ def get_pair_profile(
 @limiter.limit(config.RATE_LIMIT_DEFAULT)
 def get_matches(
     request: Request,
-    limit: int = Query(20, ge=1, le=200, description="Maximum matches to return (max 200)"),
+    limit: int = Query(20, ge=1, le=2000, description="Maximum matches to return (max 2000)"),
     tournament_id: Optional[int] = Query(None, ge=1, description="Filter by tournament id"),
     date_from: Optional[date] = Query(None, description="Filter matches from this date (YYYY-MM-DD)"),
 ):
@@ -430,7 +430,7 @@ def get_matches_head_to_head(
 def get_tournaments(
     request: Request,
     year: int = Query(2025, ge=2000, le=2100, description="Filter tournaments by year"),
-    tournament_id: Optional[int] = Query(None, ge=1, description="Filter by specific tournament id"),
+    tournament_id: Optional[int] = Query(None, ge=0, description="Filter by specific tournament id"),
 ):
     """List tournaments filtered by year or a specific tournament id."""
     query = supabase.table("tournaments").select("*")
