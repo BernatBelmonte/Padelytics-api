@@ -27,8 +27,6 @@ from supabase import Client, ClientOptions, create_client
 
 import config
 
-# ─── Supabase client ──────────────────────────────────────────────────────────
-# Credentials are read from config.py which reads .env – never hard-coded here.
 #
 # Custom httpx.Client to prevent httpx.ReadError (EAGAIN) on Render:
 #   keepalive_expiry=20  – evicts idle connections after 20 s, well below Render's
@@ -52,14 +50,11 @@ supabase: Client = create_client(
 )
 
 # ─── Rate limiter ─────────────────────────────────────────────────────────────
-# key_func=get_remote_address uses the client IP for bucketing.
-# For deployments behind a reverse proxy set the appropriate trusted-proxy header.
 limiter = Limiter(
     key_func=get_remote_address,
     default_limits=[config.RATE_LIMIT_DEFAULT],
 )
 
-# ─── App factory ─────────────────────────────────────────────────────────────
 _docs_url = "/docs" if config.APP_ENV != "production" else None
 _redoc_url = "/redoc" if config.APP_ENV != "production" else None
 
@@ -81,13 +76,11 @@ app = FastAPI(
 )
 
 # ─── Rate-limit exception handler ────────────────────────────────────────────
-# Returns a clean JSON 429 instead of an unhandled exception.
+# Returns a clean JSON 429.
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ─── CORS middleware ──────────────────────────────────────────────────────────
-# OWASP: Never use allow_origins=["*"] in production; use explicit allowlist.
-# Set ALLOWED_ORIGINS in .env (comma-separated) to match your frontend domain(s).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.ALLOWED_ORIGINS,
@@ -140,12 +133,6 @@ def home(request: Request):
 
 
 # ─── Players ─────────────────────────────────────────────────────────────────
-# /players                                  - list with search
-# /players/ranking                          - official ranking (latest snapshot)
-# /players/head-to-head?player1=&player2=   - compare 2 players
-# /players/{slug}                           - profile + evolution
-# NOTE: specific routes MUST be registered before /{slug} to avoid shadowing.
-
 @app.get("/players", tags=["Players"])
 @limiter.limit(config.RATE_LIMIT_DEFAULT)
 def get_players(
@@ -267,7 +254,6 @@ def get_player_profile(
 
 
 # ─── Pairs ───────────────────────────────────────────────────────────────────
-
 @app.get("/pairs", tags=["Pairs"])
 @limiter.limit(config.RATE_LIMIT_DEFAULT)
 def get_pairs(
@@ -387,7 +373,6 @@ def get_pair_profile(
 
 
 # ─── Matches ─────────────────────────────────────────────────────────────────
-
 @app.get("/matches", tags=["Matches"])
 @limiter.limit(config.RATE_LIMIT_DEFAULT)
 def get_matches(
@@ -455,7 +440,6 @@ def get_matches_head_to_head(
 
 
 # ─── Tournaments ─────────────────────────────────────────────────────────────
-
 @app.get("/tournaments", tags=["Tournaments"])
 @limiter.limit(config.RATE_LIMIT_DEFAULT)
 def get_tournaments(
@@ -474,7 +458,6 @@ def get_tournaments(
 
 
 # ─── Analytics / Search ───────────────────────────────────────────────────────
-
 @app.get("/search", tags=["Analytics"])
 @limiter.limit(config.RATE_LIMIT_SEARCH)   # Stricter limit: hits 3 tables simultaneously
 def global_search(
