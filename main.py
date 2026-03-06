@@ -12,22 +12,44 @@ Security hardening applied (OWASP Top 10, 2021):
 """
 
 import re
+from contextlib import asynccontextmanager
 from datetime import date
 from typing import Optional
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
-from supabase import Client, create_client
+from supabase import Client, ClientOptions, create_client
 
 import config
 
 # ─── Supabase client ──────────────────────────────────────────────────────────
 # Credentials are read from config.py which reads .env – never hard-coded here.
-supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
+#
+# Custom httpx.Client to prevent httpx.ReadError (EAGAIN) on Render:
+#   keepalive_expiry=20  – evicts idle connections after 20 s, well below Render's
+#                          ~55 s idle-close threshold, so we never reuse a stale socket.
+#   HTTPTransport(retries=1) – auto-retries once on any remaining transient error.
+#   Explicit timeouts     – avoids silent hangs on slow cold starts.
+_http_client = httpx.Client(
+    transport=httpx.HTTPTransport(retries=1),
+    timeout=httpx.Timeout(30.0, connect=10.0),
+    limits=httpx.Limits(
+        max_connections=10,
+        max_keepalive_connections=5,
+        keepalive_expiry=20.0,
+    ),
+)
+
+supabase: Client = create_client(
+    config.SUPABASE_URL,
+    config.SUPABASE_KEY,
+    options=ClientOptions(httpx_client=_http_client),
+)
 
 # ─── Rate limiter ─────────────────────────────────────────────────────────────
 # key_func=get_remote_address uses the client IP for bucketing.
@@ -41,12 +63,21 @@ limiter = Limiter(
 _docs_url = "/docs" if config.APP_ENV != "production" else None
 _redoc_url = "/redoc" if config.APP_ENV != "production" else None
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Cleanly close the shared httpx.Client on shutdown so OS sockets are released.
+    _http_client.close()
+
+
 app = FastAPI(
     title="Padelytics API – Padel Pro Analytics",
     description="Advanced API for accessing professional padel data from Premier Padel.",
     version="2.0.0",
     docs_url=_docs_url,
     redoc_url=_redoc_url,
+    lifespan=lifespan,
 )
 
 # ─── Rate-limit exception handler ────────────────────────────────────────────
