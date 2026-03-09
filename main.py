@@ -25,19 +25,14 @@ from supabase import Client, create_client
 
 import config
 
-# ─── Supabase client ──────────────────────────────────────────────────────────
-# Credentials are read from config.py which reads .env – never hard-coded here.
 supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
 
 # ─── Rate limiter ─────────────────────────────────────────────────────────────
-# key_func=get_remote_address uses the client IP for bucketing.
-# For deployments behind a reverse proxy set the appropriate trusted-proxy header.
 limiter = Limiter(
     key_func=get_remote_address,
     default_limits=[config.RATE_LIMIT_DEFAULT],
 )
 
-# ─── App factory ─────────────────────────────────────────────────────────────
 _docs_url = "/docs" if config.APP_ENV != "production" else None
 _redoc_url = "/redoc" if config.APP_ENV != "production" else None
 
@@ -50,13 +45,10 @@ app = FastAPI(
 )
 
 # ─── Rate-limit exception handler ────────────────────────────────────────────
-# Returns a clean JSON 429 instead of an unhandled exception.
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ─── CORS middleware ──────────────────────────────────────────────────────────
-# OWASP: Never use allow_origins=["*"] in production; use explicit allowlist.
-# Set ALLOWED_ORIGINS in .env (comma-separated) to match your frontend domain(s).
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.ALLOWED_ORIGINS,
@@ -67,7 +59,6 @@ app.add_middleware(
 
 
 # ─── Security headers middleware ──────────────────────────────────────────────
-# Adds defence-in-depth HTTP security headers to every response.
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next) -> Response:
     response = await call_next(request)
@@ -105,15 +96,16 @@ def _validate_slug(value: str, field_name: str = "slug") -> str:
 @app.get("/", tags=["General"])
 @limiter.limit(config.RATE_LIMIT_DEFAULT)
 def home(request: Request):
+    """
+    API health-check and entry point.
+
+    Returns a welcome message and the URL to the interactive documentation.
+    Use this endpoint to verify the service is running.
+    """
     return {"message": "Padelytics API 🎾", "docs": "/docs"}
 
 
 # ─── Players ─────────────────────────────────────────────────────────────────
-# /players                                  - list with search
-# /players/ranking                          - official ranking (latest snapshot)
-# /players/head-to-head?player1=&player2=   - compare 2 players
-# /players/{slug}                           - profile + evolution
-# NOTE: specific routes MUST be registered before /{slug} to avoid shadowing.
 
 @app.get("/players", tags=["Players"])
 @limiter.limit(config.RATE_LIMIT_DEFAULT)
@@ -128,7 +120,15 @@ def get_players(
         description="Case-insensitive name search",
     ),
 ):
-    """Returns a paginated list of players. Supports name search."""
+    """
+    Return a paginated list of all players in the database.
+
+    **Pagination**: use `skip` and `limit` to page through results.
+
+    **Search**: supply `search` for a case-insensitive partial match on the player's name.
+
+    **Response**: array of player objects from the `players` table.
+    """
     query = supabase.table("players").select("*")
     if search:
         # search is already length-validated by Pydantic; strip further safety
@@ -143,7 +143,15 @@ def get_players_ranking(
     request: Request,
     limit: int = Query(50, ge=1, le=2000, description="Maximum players to return (max 2000)"),
 ):
-    """Returns the latest ranking snapshot ordered by points descending."""
+    """
+    Return the latest official player ranking snapshot.
+
+    Looks up the most recent `snapshot_date` in `dynamic_players` and returns
+    players ordered by `points` descending. Each row embeds the static player
+    profile from the `players` table.
+
+    **Response**: array of `dynamic_players` rows with a nested `players` object.
+    """
     latest = (
         supabase.table("dynamic_players")
         .select("snapshot_date")
@@ -184,7 +192,20 @@ def get_players_head_to_head(
         description="Slug of the second player",
     ),
 ):
-    """Compare two players using their latest stats."""
+    """
+    Compare two players side-by-side using their most recent stats snapshot.
+
+    Each player is identified by their URL `slug`. The endpoint fetches the
+    latest `dynamic_players` row for each slug, embedding the static player
+    profile.
+
+    **Query parameters**:
+    - `player1`: slug of the first player (required)
+    - `player2`: slug of the second player (required)
+
+    **Response**: `{ player1: {...}, player2: {...} }` — each value is the latest
+    `dynamic_players` row with a nested `players` object.
+    """
     p1_res = (
         supabase.table("dynamic_players")
         .select("*, players(*)")
@@ -215,7 +236,21 @@ def get_player_profile(
     slug: str = Path(..., min_length=1, max_length=100, description="Player slug"),
     history: int = Query(10, ge=1, le=100, description="Snapshot history depth (max 100)"),
 ):
-    """Static profile + evolution history for a single player."""
+    """
+    Return the static profile and ranking evolution history for a single player.
+
+    The `profile` section comes from the `players` table (immutable bio data).
+    The `history` section is up to `history` snapshots from `dynamic_players`,
+    ordered most-recent first, allowing you to chart points or rank over time.
+
+    **Path parameter**:
+    - `slug`: player slug (lowercase alphanumeric with hyphens)
+
+    **Query parameter**:
+    - `history`: number of past snapshots to return (1–100, default 10)
+
+    **Response**: `{ profile: {...}, history: [...] }`
+    """
     # Extra server-side slug validation (defence-in-depth beyond Path constraints)
     _validate_slug(slug, "player slug")
     player = supabase.table("players").select("*").eq("slug", slug).execute()
@@ -250,7 +285,15 @@ def get_pairs(
         description="Case-insensitive pair_slug search",
     ),
 ):
-    """Returns a paginated list of pairs. Supports pair_slug search."""
+    """
+    Return a paginated list of pairs from the `dynamic_pairs` table.
+
+    **Pagination**: use `skip` and `limit` to page through results.
+
+    **Search**: supply `search` for a case-insensitive partial match on `pair_slug`.
+
+    **Response**: array of `dynamic_pairs` rows (latest snapshot per pair).
+    """
     query = supabase.table("dynamic_pairs").select("*")
     if search:
         query = query.ilike("pair_slug", f"%{search.strip()}%")
@@ -264,7 +307,15 @@ def get_pairs_ranking(
     request: Request,
     limit: int = Query(50, ge=1, le=2000, description="Maximum pairs to return (max 2000)"),
 ):
-    """Returns the latest pairs ranking snapshot ordered by points descending."""
+    """
+    Return the latest official pairs ranking snapshot.
+
+    Looks up the most recent `snapshot_date` in `dynamic_pairs` and returns
+    pairs ordered by `points` descending. Each row embeds both player profiles
+    from the `players` table via the `player1_slug` and `player2_slug` foreign keys.
+
+    **Response**: array of `dynamic_pairs` rows with nested `player1` and `player2` objects.
+    """
     latest = (
         supabase.table("dynamic_pairs")
         .select("snapshot_date")
@@ -305,7 +356,22 @@ def get_pairs_head_to_head(
         description="Slug of the second pair",
     ),
 ):
-    """Compare two pairs using their latest stats."""
+    """
+    Compare two pairs side-by-side using their most recent stats snapshot.
+
+    Each pair is identified by its `pair_slug`. The endpoint fetches the latest
+    `dynamic_pairs` row for each slug, embedding both player profiles.
+
+    Note: stats here are **pre-aggregated across all matches** with no context
+    filters. For environment- or round-filtered analysis use `/pairs/contextual-stats`.
+
+    **Query parameters**:
+    - `slug1`: slug of the first pair (required)
+    - `slug2`: slug of the second pair (required)
+
+    **Response**: `{ pair1: {...}, pair2: {...} }` — each value is the latest
+    `dynamic_pairs` row with nested `player1` and `player2` objects.
+    """
     p1_res = (
         supabase.table("dynamic_pairs")
         .select("*, player1:players!player1_slug(*), player2:players!player2_slug(*)")
@@ -329,6 +395,197 @@ def get_pairs_head_to_head(
     return {"pair1": p1_res.data[0], "pair2": p2_res.data[0]}
 
 
+# ─── Contextual stats helper ──────────────────────────────────────────────────
+
+def _pair_wins_losses(matches: list, pair_slug: str) -> dict:
+    """Compute win/loss/total/win_rate for one pair from a list of match rows."""
+    wins = losses = 0
+    for m in matches:
+        if m["team1_slug"] == pair_slug:
+            if m["winner_team"] == 1:
+                wins += 1
+            else:
+                losses += 1
+        elif m["team2_slug"] == pair_slug:
+            if m["winner_team"] == 2:
+                wins += 1
+            else:
+                losses += 1
+    total = wins + losses
+    return {
+        "wins": wins,
+        "losses": losses,
+        "total_matches": total,
+        "win_rate": round(wins / total, 3) if total else None,
+    }
+
+
+@app.get("/pairs/contextual-stats", tags=["Pairs"])
+@limiter.limit(config.RATE_LIMIT_SEARCH)
+def get_pairs_contextual_stats(
+    request: Request,
+    slug1: str = Query(
+        ...,
+        min_length=1,
+        max_length=100,
+        pattern=_SLUG_PATTERN,
+        description="Slug of the first pair",
+    ),
+    slug2: str = Query(
+        ...,
+        min_length=1,
+        max_length=100,
+        pattern=_SLUG_PATTERN,
+        description="Slug of the second pair",
+    ),
+    tournament_level: Optional[str] = Query(
+        None,
+        pattern=r"^(FINALS|MAJOR|P1|P2)$",
+        description="Tournament level: FINALS, MAJOR, P1, or P2",
+    ),
+    venue_type: Optional[str] = Query(
+        None,
+        pattern=r"^(indoor|outdoor)$",
+        description="Venue type: indoor or outdoor",
+    ),
+    altitude_min: Optional[int] = Query(None, ge=0, description="Minimum venue altitude (metres)"),
+    altitude_max: Optional[int] = Query(None, ge=0, description="Maximum venue altitude (metres)"),
+    temp_min: Optional[float] = Query(None, description="Minimum average temperature (°C)"),
+    temp_max: Optional[float] = Query(None, description="Maximum average temperature (°C)"),
+    humidity_min: Optional[float] = Query(None, ge=0, le=100, description="Minimum average humidity (%)"),
+    humidity_max: Optional[float] = Query(None, ge=0, le=100, description="Maximum average humidity (%)"),
+    court_speed_min: Optional[float] = Query(None, ge=0, description="Minimum court speed index"),
+    court_speed_max: Optional[float] = Query(None, ge=0, description="Maximum court speed index"),
+    round_name: Optional[str] = Query(
+        None,
+        pattern=r"^(Men F|Men SF|Men QF|Men R16|Men R32)$",
+        description="Round stage: Men F, Men SF, Men QF, Men R16, or Men R32",
+    ),
+):
+    """
+    Compare two pairs within a specific environmental and/or round context.
+
+    Stats are recomputed from raw match data — not from pre-aggregated snapshots —
+    so every active filter is applied before wins/losses are counted.
+
+    **Tournament filters** (applied via the tournaments table):
+    tournament_level, venue_type, altitude, avg_temperature, avg_humidity, court_speed_index
+
+    **Match filter**: round_name
+
+    **Response sections**:
+    - `head_to_head`: record when the two pairs faced *each other* inside the context
+    - `individual_context`: each pair's overall record vs *any* opponent inside the context
+    - `matches_in_context`: raw head-to-head match list used for the H2H calculation
+    """
+    t_query = supabase.table("tournaments").select("id")
+    if tournament_level is not None:
+        t_query = t_query.eq("tournament_level", tournament_level)
+    if venue_type is not None:
+        t_query = t_query.eq("venue_type", venue_type)
+    if altitude_min is not None:
+        t_query = t_query.gte("altitude", altitude_min)
+    if altitude_max is not None:
+        t_query = t_query.lte("altitude", altitude_max)
+    if temp_min is not None:
+        t_query = t_query.gte("avg_temperature", temp_min)
+    if temp_max is not None:
+        t_query = t_query.lte("avg_temperature", temp_max)
+    if humidity_min is not None:
+        t_query = t_query.gte("avg_humidity", humidity_min)
+    if humidity_max is not None:
+        t_query = t_query.lte("avg_humidity", humidity_max)
+    if court_speed_min is not None:
+        t_query = t_query.gte("court_speed_index", court_speed_min)
+    if court_speed_max is not None:
+        t_query = t_query.lte("court_speed_index", court_speed_max)
+
+    t_res = t_query.execute()
+    if not t_res.data:
+        return {
+            "filters_matched_tournaments": 0,
+            "message": "No tournaments match the given environmental filters.",
+            "applied_filters": {
+                "tournament_level": tournament_level,
+                "venue_type": venue_type,
+                "altitude_min": altitude_min,
+                "altitude_max": altitude_max,
+                "temp_min": temp_min,
+                "temp_max": temp_max,
+                "humidity_min": humidity_min,
+                "humidity_max": humidity_max,
+                "court_speed_min": court_speed_min,
+                "court_speed_max": court_speed_max,
+                "round_name": round_name,
+            },
+            "head_to_head": None,
+            "individual_context": {slug1: None, slug2: None},
+            "matches_in_context": [],
+        }
+
+    tournament_ids_str = "({})".format(",".join(str(t["id"]) for t in t_res.data))
+
+    slugs_str = f"({slug1},{slug2})"
+    h2h_query = (
+        supabase.table("matches")
+        .select("*")
+        .filter("team1_slug", "in", slugs_str)
+        .filter("team2_slug", "in", slugs_str)
+        .filter("tournament_id", "in", tournament_ids_str)
+        .order("date", desc=True)
+    )
+    if round_name is not None:
+        h2h_query = h2h_query.eq("round_name", round_name)
+    h2h_matches = h2h_query.execute().data
+
+    def _individual_record(slug: str) -> dict:
+        q = (
+            supabase.table("matches")
+            .select("winner_team, team1_slug, team2_slug")
+            .or_(f"team1_slug.eq.{slug},team2_slug.eq.{slug}")
+            .filter("tournament_id", "in", tournament_ids_str)
+        )
+        if round_name is not None:
+            q = q.eq("round_name", round_name)
+        return _pair_wins_losses(q.execute().data, slug)
+
+    slug1_h2h = _pair_wins_losses(h2h_matches, slug1)
+    slug2_h2h = _pair_wins_losses(h2h_matches, slug2)
+
+    return {
+        "filters_matched_tournaments": len(t_res.data),
+        "applied_filters": {
+            "tournament_level": tournament_level,
+            "venue_type": venue_type,
+            "altitude_min": altitude_min,
+            "altitude_max": altitude_max,
+            "temp_min": temp_min,
+            "temp_max": temp_max,
+            "humidity_min": humidity_min,
+            "humidity_max": humidity_max,
+            "court_speed_min": court_speed_min,
+            "court_speed_max": court_speed_max,
+            "round_name": round_name,
+        },
+        "head_to_head": {
+            "summary": {
+                slug1: slug1_h2h["wins"],
+                slug2: slug2_h2h["wins"],
+                "total_matches": len(h2h_matches),
+            },
+            "detail": {
+                slug1: slug1_h2h,
+                slug2: slug2_h2h,
+            },
+        },
+        "individual_context": {
+            slug1: _individual_record(slug1),
+            slug2: _individual_record(slug2),
+        },
+        "matches_in_context": h2h_matches,
+    }
+
+
 @app.get("/pairs/{pair_slug}", tags=["Pairs"])
 @limiter.limit(config.RATE_LIMIT_DEFAULT)
 def get_pair_profile(
@@ -336,7 +593,21 @@ def get_pair_profile(
     pair_slug: str = Path(..., min_length=1, max_length=100, description="Pair slug"),
     history: int = Query(10, ge=1, le=100, description="Snapshot history depth (max 100)"),
 ):
-    """Pair profile + evolution history."""
+    """
+    Return the profile and ranking evolution history for a single pair.
+
+    The `profile` section is the most recent `dynamic_pairs` row for the pair.
+    The `history` section contains up to `history` snapshots ordered most-recent
+    first, allowing you to chart points, win rate, or rank over time.
+
+    **Path parameter**:
+    - `pair_slug`: pair slug (lowercase alphanumeric with hyphens)
+
+    **Query parameter**:
+    - `history`: number of past snapshots to return (1–100, default 10)
+
+    **Response**: `{ profile: {...}, history: [...] }`
+    """
     _validate_slug(pair_slug, "pair slug")
     pair = supabase.table("dynamic_pairs").select("*").eq("pair_slug", pair_slug).execute()
     if not pair.data:
@@ -365,7 +636,17 @@ def get_matches(
     tournament_id: Optional[int] = Query(None, ge=1, description="Filter by tournament id"),
     date_from: Optional[date] = Query(None, description="Filter matches from this date (YYYY-MM-DD)"),
 ):
-    """List matches with optional filters and pagination."""
+    """
+    Return a list of matches ordered by date descending.
+
+    **Filters**:
+    - `tournament_id`: restrict to a single tournament
+    - `date_from`: only return matches on or after this date (YYYY-MM-DD)
+
+    **Pagination**: use `limit` to cap the number of results (max 2000).
+
+    **Response**: array of match rows from the `matches` table.
+    """
     query = supabase.table("matches").select("*").order("date", desc=True)
     if tournament_id is not None:
         query = query.eq("tournament_id", tournament_id)
@@ -393,7 +674,20 @@ def get_matches_head_to_head(
         description="Slug of the second pair",
     ),
 ):
-    """Match history between two pairs, using query params (?pair1=&pair2=)."""
+    """
+    Return the full head-to-head match history between two pairs.
+
+    Fetches every match where both `pair1` and `pair2` appeared (in either
+    `team1_slug` or `team2_slug`), then computes win totals for each side.
+
+    **Query parameters**:
+    - `pair1`: slug of the first pair (required)
+    - `pair2`: slug of the second pair (required)
+
+    **Response**:
+    - `summary`: `{ pair1_slug: wins, pair2_slug: wins, total_matches: N }`
+    - `history`: full list of match rows ordered by date descending
+    """
     slugs = f"({pair1},{pair2})"
     res = (
         supabase.table("matches")
@@ -432,7 +726,17 @@ def get_tournaments(
     year: int = Query(2025, ge=2000, le=2100, description="Filter tournaments by year"),
     tournament_id: Optional[int] = Query(None, ge=0, description="Filter by specific tournament id"),
 ):
-    """List tournaments filtered by year or a specific tournament id."""
+    """
+    Return a list of tournaments ordered by start date ascending.
+
+    **Filters** (mutually exclusive — `tournament_id` takes priority):
+    - `tournament_id`: return a single specific tournament by its id
+    - `year`: return all tournaments whose `start_date` falls within that year
+      (default: 2025)
+
+    **Response**: array of tournament rows including venue metadata
+    (altitude, avg_temperature, avg_humidity, court_speed_index, venue_type, etc.)
+    """
     query = supabase.table("tournaments").select("*")
     if tournament_id is not None:
         query = query.eq("id", tournament_id)
@@ -455,7 +759,21 @@ def global_search(
         description="Search term (players, pairs, tournaments)",
     ),
 ):
-    """Search players, pairs, and tournaments simultaneously."""
+    """
+    Search players, pairs, and tournaments simultaneously with a single query.
+
+    The search term is matched case-insensitively against:
+    - `players.name` → returns up to 5 player results
+    - `dynamic_pairs.pair_slug` → returns up to 5 pair results
+    - `tournaments.full_name` → returns up to 3 tournament results
+
+    **Query parameter**:
+    - `q`: search term (1–100 characters, required)
+
+    **Response**: flat array of result objects, each with a `type` field
+    (`"player"`, `"pair_slug"`, or `"tournament"`), a `slug` or `id`, and a
+    human-readable `label`.
+    """
     term = q.strip()
     results = []
     for p in (
