@@ -16,7 +16,7 @@ import math
 import re
 from contextlib import asynccontextmanager
 from datetime import date
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 import joblib
@@ -473,15 +473,13 @@ def get_pairs_contextual_stats(
         pattern=_SLUG_PATTERN,
         description="Slug of the second pair",
     ),
-    tournament_level: Optional[str] = Query(
-        None,
-        pattern=r"^(FINALS|MAJOR|P1|P2)$",
-        description="Tournament level: FINALS, MAJOR, P1, or P2",
+    tournament_level: Optional[List[str]] = Query(
+        default=None,
+        description="List of tournament levels: FINALS, MAJOR, P1, or P2",
     ),
-    venue_type: Optional[str] = Query(
-        None,
-        pattern=r"^(indoor|outdoor)$",
-        description="Venue type: indoor or outdoor",
+    venue_type: Optional[List[str]] = Query(
+        default=None,
+        description="List of venue types: indoor or outdoor",
     ),
     altitude_min: Optional[int] = Query(None, ge=0, description="Minimum venue altitude (metres)"),
     altitude_max: Optional[int] = Query(None, ge=0, description="Maximum venue altitude (metres)"),
@@ -491,10 +489,9 @@ def get_pairs_contextual_stats(
     humidity_max: Optional[float] = Query(None, ge=0, le=100, description="Maximum average humidity (%)"),
     court_speed_min: Optional[float] = Query(None, ge=0, description="Minimum court speed index"),
     court_speed_max: Optional[float] = Query(None, ge=0, description="Maximum court speed index"),
-    round_name: Optional[str] = Query(
-        None,
-        pattern=r"^(Men F|Men SF|Men QF|Men R16|Men R32)$",
-        description="Round stage: Men F, Men SF, Men QF, Men R16, or Men R32",
+    round_name: Optional[List[str]] = Query(
+        default=None,
+        description="List of round stages: Men F, Men SF, Men QF, Men R16, or Men R32",
     ),
 ):
     """
@@ -513,11 +510,27 @@ def get_pairs_contextual_stats(
     - `individual_context`: each pair's overall record vs *any* opponent inside the context
     - `matches_in_context`: raw head-to-head match list used for the H2H calculation
     """
+    _VALID_LEVELS = {"FINALS", "MAJOR", "P1", "P2"}
+    _VALID_VENUES = {"indoor", "outdoor"}
+    _VALID_ROUNDS = {"Men F", "Men SF", "Men QF", "Men R16", "Men R32"}
+    if tournament_level:
+        invalid = [v for v in tournament_level if v not in _VALID_LEVELS]
+        if invalid:
+            raise HTTPException(status_code=422, detail=f"Invalid tournament_level value(s): {invalid}")
+    if venue_type:
+        invalid = [v for v in venue_type if v not in _VALID_VENUES]
+        if invalid:
+            raise HTTPException(status_code=422, detail=f"Invalid venue_type value(s): {invalid}")
+    if round_name:
+        invalid = [v for v in round_name if v not in _VALID_ROUNDS]
+        if invalid:
+            raise HTTPException(status_code=422, detail=f"Invalid round_name value(s): {invalid}")
+
     t_query = supabase.table("tournaments").select("id")
-    if tournament_level is not None:
-        t_query = t_query.eq("tournament_level", tournament_level)
-    if venue_type is not None:
-        t_query = t_query.eq("venue_type", venue_type)
+    if tournament_level:
+        t_query = t_query.in_("tournament_level", tournament_level)
+    if venue_type:
+        t_query = t_query.in_("venue_type", venue_type)
     if altitude_min is not None:
         t_query = t_query.gte("altitude", altitude_min)
     if altitude_max is not None:
@@ -569,8 +582,8 @@ def get_pairs_contextual_stats(
         .filter("tournament_id", "in", tournament_ids_str)
         .order("date", desc=True)
     )
-    if round_name is not None:
-        h2h_query = h2h_query.eq("round_name", round_name)
+    if round_name:
+        h2h_query = h2h_query.in_("round_name", round_name)
     h2h_matches = h2h_query.execute().data
 
     def _individual_record(slug: str) -> dict:
@@ -580,8 +593,8 @@ def get_pairs_contextual_stats(
             .or_(f"team1_slug.eq.{slug},team2_slug.eq.{slug}")
             .filter("tournament_id", "in", tournament_ids_str)
         )
-        if round_name is not None:
-            q = q.eq("round_name", round_name)
+        if round_name:
+            q = q.in_("round_name", round_name)
         return _pair_wins_losses(q.execute().data, slug)
 
     slug1_h2h = _pair_wins_losses(h2h_matches, slug1)
