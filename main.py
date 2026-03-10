@@ -14,6 +14,7 @@ Security hardening applied (OWASP Top 10, 2021):
 import io
 import math
 import re
+import warnings
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import List, Optional
@@ -21,6 +22,7 @@ from typing import List, Optional
 import httpx
 import joblib
 import numpy as np
+import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -863,7 +865,11 @@ def _get_model():
     global _model_cache
     if _model_cache is None:
         model_bytes = supabase.storage.from_("models").download("final_padel_model.pkl")
-        _model_cache = joblib.load(io.BytesIO(model_bytes))
+        # Suppress the XGBoost serialisation-version mismatch UserWarning;
+        # the model loads and predicts correctly despite the older pickle format.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
+            _model_cache = joblib.load(io.BytesIO(model_bytes))
     return _model_cache
 
 
@@ -1046,8 +1052,24 @@ def simulate_match(request: Request, body: SimulateRequest):
         )
 
     # 6. Load model (cached) and predict
+    _MODEL_COLUMNS = [
+        "match_quality_sum",
+        "court_speed_index",
+        "diff_log_total_points",
+        "diff_points_change",
+        "diff_tournaments_played_together",
+        "diff_matches_last_14_days",
+        "diff_finals_conversion_rate",
+        "diff_season_win_pct",
+        "diff_avg_games_conceded_per_set",
+        "diff_tie_break_win_pct",
+        "diff_comeback_rate",
+        "diff_avg_height",
+    ]
     model = _get_model()
-    X = np.array([features], dtype=float)
+    # Pass a named DataFrame so pipelines with StandardScaler (fitted on a
+    # DataFrame) do not raise feature-name validation warnings.
+    X = pd.DataFrame([features], columns=_MODEL_COLUMNS)
 
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(X)[0]

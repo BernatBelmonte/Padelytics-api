@@ -5,6 +5,7 @@ python-dotenv
 gunicorn
 slowapi
 numpy
+pandas
 scikit-learn
 joblib
 xgboost
