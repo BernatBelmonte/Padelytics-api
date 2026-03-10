@@ -11,15 +11,20 @@ Security hardening applied (OWASP Top 10, 2021):
   A07 Identification/AuthN     → Rate limiting (IP-based) via slowapi; 429 on breach
 """
 
+import io
+import math
 import re
 from contextlib import asynccontextmanager
 from datetime import date
 from typing import Optional
 
 import httpx
+import joblib
+import numpy as np
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
@@ -84,7 +89,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=config.ALLOWED_ORIGINS,
     allow_credentials=False,          # No cookies/sessions used
-    allow_methods=["GET"],            # This API is read-only
+    allow_methods=["GET", "POST"],    # POST required for /simulate
     allow_headers=["Content-Type", "Authorization"],
 )
 
@@ -832,3 +837,235 @@ def global_search(
     ):
         results.append({"type": "tournament", "id": str(t["id"]), "label": t["full_name"]})
     return results
+
+
+# ─── AI / Match Simulation ────────────────────────────────────────────────────
+
+# Cached model – downloaded once from Supabase Storage on first call.
+_model_cache = None
+
+
+def _get_model():
+    """Download and cache the padel prediction model from Supabase Storage."""
+    global _model_cache
+    if _model_cache is None:
+        model_bytes = supabase.storage.from_("models").download("final_padel_model.pkl")
+        _model_cache = joblib.load(io.BytesIO(model_bytes))
+    return _model_cache
+
+
+def _calculate_smart_speed_index(
+    venue_type: str,
+    altitude: float,
+    avg_temperature: float,
+    avg_humidity: float,
+) -> float:
+    """Calculates a Smart Court Speed Index based on venue and environmental factors."""
+    is_indoor = "indoor" in venue_type.lower()
+
+    altitude_score = altitude * 0.012
+
+    temp = avg_temperature
+    if temp < 10:
+        raw_temp_score = (temp - 10) * 1.5
+    elif temp <= 22:
+        raw_temp_score = (temp - 10) * 0.5
+    else:
+        raw_temp_score = 6 + (temp - 22) * 2.0
+
+    raw_hum_penalty = (avg_humidity - 45) * 0.5 if avg_humidity > 45 else 0.0
+
+    weather_weight = 0.2 if is_indoor else 1.0
+    final_temp_score = raw_temp_score * weather_weight
+    final_hum_penalty = raw_hum_penalty * weather_weight
+
+    indoor_bonus = 5.0 if is_indoor else 0.0
+
+    return 50.0 + altitude_score + final_temp_score - final_hum_penalty + indoor_bonus
+
+
+def _nan_to_none(v: float):
+    """Convert float NaN to None for JSON serialisation."""
+    return None if (v is None or math.isnan(v)) else v
+
+
+class SimulateRequest(BaseModel):
+    pair1_slug: str = Field(..., min_length=1, max_length=100, pattern=_SLUG_PATTERN)
+    pair2_slug: str = Field(..., min_length=1, max_length=100, pattern=_SLUG_PATTERN)
+    venue_type: str = Field(..., pattern=r"^(indoor|outdoor)$")
+    altitude: float = Field(..., ge=0, le=5000)
+    avg_temperature: float = Field(..., ge=-20, le=60)
+    avg_humidity: float = Field(..., ge=0, le=100)
+
+
+@app.post("/simulate", tags=["AI"])
+@limiter.limit(config.RATE_LIMIT_SEARCH)
+def simulate_match(request: Request, body: SimulateRequest):
+    """
+    Predict the winner of a match between two pairs under specific venue conditions.
+
+    The endpoint fetches the latest stats for each pair, computes all model
+    features server-side (including court speed index and height diff), loads
+    the pre-trained model from Supabase Storage, and returns win probabilities.
+
+    **Body parameters**:
+    - `pair1_slug` / `pair2_slug`: pair slugs (required)
+    - `venue_type`: `"indoor"` or `"outdoor"` (required)
+    - `altitude`: metres above sea level (0–5000, required)
+    - `avg_temperature`: °C (-20–60, required)
+    - `avg_humidity`: % (0–100, required)
+
+    **Response**: win probabilities and predicted winner from pair1's perspective.
+    """
+    # 1. Fetch latest dynamic_pairs snapshot for both pairs
+    p1_res = (
+        supabase.table("dynamic_pairs")
+        .select("*")
+        .eq("pair_slug", body.pair1_slug)
+        .order("snapshot_date", desc=True)
+        .limit(1)
+        .execute()
+    )
+    p2_res = (
+        supabase.table("dynamic_pairs")
+        .select("*")
+        .eq("pair_slug", body.pair2_slug)
+        .order("snapshot_date", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not p1_res.data:
+        raise HTTPException(404, detail=f"Pair '{body.pair1_slug}' not found")
+    if not p2_res.data:
+        raise HTTPException(404, detail=f"Pair '{body.pair2_slug}' not found")
+
+    p1 = p1_res.data[0]
+    p2 = p2_res.data[0]
+
+    # 2. Fetch player heights for all four players
+    all_slugs = list({
+        p1["player1_slug"], p1["player2_slug"],
+        p2["player1_slug"], p2["player2_slug"],
+    })
+    players_res = (
+        supabase.table("players")
+        .select("slug, height")
+        .in_("slug", all_slugs)
+        .execute()
+    )
+    height_map: dict = {row["slug"]: row.get("height") for row in players_res.data}
+
+    h_p1_a = height_map.get(p1["player1_slug"])
+    h_p1_b = height_map.get(p1["player2_slug"])
+    h_p2_a = height_map.get(p2["player1_slug"])
+    h_p2_b = height_map.get(p2["player2_slug"])
+
+    if None in (h_p1_a, h_p1_b, h_p2_a, h_p2_b):
+        diff_avg_height = float("nan")
+    else:
+        diff_avg_height = ((h_p1_a + h_p1_b) / 2) - ((h_p2_a + h_p2_b) / 2)
+
+    # 3. Court speed index
+    court_speed = _calculate_smart_speed_index(
+        body.venue_type, body.altitude, body.avg_temperature, body.avg_humidity
+    )
+
+    # 4. Build feature vector (order must match EXPECTED_FEATURES)
+    def _f(val):
+        """Return float, or NaN if None."""
+        return float("nan") if val is None else float(val)
+
+    p1_pts = _f(p1.get("points"))
+    p2_pts = _f(p2.get("points"))
+
+    log_diff = (
+        math.log(p1_pts) - math.log(p2_pts)
+        if p1_pts > 0 and p2_pts > 0
+        else float("nan")
+    )
+
+    features = [
+        p1_pts + p2_pts,                                                              # match_quality_sum
+        court_speed,                                                                   # court_speed_index
+        log_diff,                                                                      # diff_log_total_points
+        _f(p1.get("points_change")) - _f(p2.get("points_change")),                    # diff_points_change
+        _f(p1.get("tournaments_played_together")) - _f(p2.get("tournaments_played_together")),  # diff_tournaments_played_together
+        _f(p1.get("matches_last_14_days")) - _f(p2.get("matches_last_14_days")),      # diff_matches_last_14_days
+        _f(p1.get("finals_conversion_rate")) - _f(p2.get("finals_conversion_rate")),  # diff_finals_conversion_rate
+        _f(p1.get("win_pct")) - _f(p2.get("win_pct")),                                # diff_season_win_pct
+        _f(p1.get("avg_games_conceded_per_set")) - _f(p2.get("avg_games_conceded_per_set")),  # diff_avg_games_conceded_per_set
+        _f(p1.get("tie_break_win_pct")) - _f(p2.get("tie_break_win_pct")),            # diff_tie_break_win_pct
+        _f(p1.get("comeback_rate")) - _f(p2.get("comeback_rate")),                    # diff_comeback_rate
+        diff_avg_height,                                                               # diff_avg_height
+    ]
+
+    # 5. Guard: reject simulation if any feature is NaN (Logistic Regression inside
+    #    the VotingClassifier cannot handle missing values).
+    _FEATURE_NAMES = [
+        "match_quality_sum (points)",
+        "court_speed_index",
+        "diff_log_total_points (points)",
+        "diff_points_change",
+        "diff_tournaments_played_together",
+        "diff_matches_last_14_days",
+        "diff_finals_conversion_rate",
+        "diff_season_win_pct",
+        "diff_avg_games_conceded_per_set",
+        "diff_tie_break_win_pct",
+        "diff_comeback_rate",
+        "diff_avg_height",
+    ]
+    missing_fields = [
+        _FEATURE_NAMES[i]
+        for i, v in enumerate(features)
+        if math.isnan(v)
+    ]
+    if missing_fields:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    "Simulation could not be completed due to insufficient data. "
+                    "One or more required statistics are missing for the selected pairs."
+                ),
+                "missing_fields": missing_fields,
+            },
+        )
+
+    # 6. Load model (cached) and predict
+    model = _get_model()
+    X = np.array([features], dtype=float)
+
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)[0]
+        # Class 1 = pair1 wins, class 0 = pair2 wins
+        pair1_win_prob = round(float(proba[1]), 4)
+        pair2_win_prob = round(float(proba[0]), 4)
+    else:
+        pred = int(model.predict(X)[0])
+        pair1_win_prob = 1.0 if pred == 1 else 0.0
+        pair2_win_prob = 1.0 - pair1_win_prob
+
+    predicted_winner = body.pair1_slug if pair1_win_prob >= 0.5 else body.pair2_slug
+
+    return {
+        "pair1_slug": body.pair1_slug,
+        "pair2_slug": body.pair2_slug,
+        "pair1_win_probability": pair1_win_prob,
+        "pair2_win_probability": pair2_win_prob,
+        "predicted_winner": predicted_winner,
+        "features_used": {
+            "match_quality_sum": _nan_to_none(features[0]),
+            "court_speed_index": round(court_speed, 4),
+            "diff_log_total_points": _nan_to_none(features[2]),
+            "diff_points_change": _nan_to_none(features[3]),
+            "diff_tournaments_played_together": _nan_to_none(features[4]),
+            "diff_matches_last_14_days": _nan_to_none(features[5]),
+            "diff_finals_conversion_rate": _nan_to_none(features[6]),
+            "diff_season_win_pct": _nan_to_none(features[7]),
+            "diff_avg_games_conceded_per_set": _nan_to_none(features[8]),
+            "diff_tie_break_win_pct": _nan_to_none(features[9]),
+            "diff_comeback_rate": _nan_to_none(features[10]),
+            "diff_avg_height": _nan_to_none(diff_avg_height),
+        },
+    }

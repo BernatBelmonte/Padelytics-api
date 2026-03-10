@@ -4,3 +4,7 @@ supabase
 python-dotenv
 gunicorn
 slowapi
+numpy
+scikit-learn
+joblib
+xgboost
