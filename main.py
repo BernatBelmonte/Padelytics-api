@@ -73,6 +73,7 @@ app = FastAPI(
     docs_url=_docs_url,
     redoc_url=_redoc_url,
     lifespan=lifespan,
+    root_path="/api"
 )
 
 # ─── Rate-limit exception handler ────────────────────────────────────────────
