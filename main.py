@@ -967,11 +967,6 @@ def simulate_match(request: Request, body: SimulateRequest):
     h_p2_a = height_map.get(p2["player1_slug"])
     h_p2_b = height_map.get(p2["player2_slug"])
 
-    if None in (h_p1_a, h_p1_b, h_p2_a, h_p2_b):
-        diff_avg_height = float("nan")
-    else:
-        diff_avg_height = ((h_p1_a + h_p1_b) / 2) - ((h_p2_a + h_p2_b) / 2)
-
     # 3. Court speed index
     court_speed = _calculate_smart_speed_index(
         body.venue_type, body.altitude, body.avg_temperature, body.avg_humidity
@@ -982,6 +977,10 @@ def simulate_match(request: Request, body: SimulateRequest):
         """Return float, or NaN if None."""
         return float("nan") if val is None else float(val)
 
+    def _f0(val):
+        """Return float, or 0.0 if None (safe default for optional rate stats)."""
+        return 0.0 if val is None else float(val)
+
     p1_pts = _f(p1.get("points"))
     p2_pts = _f(p2.get("points"))
 
@@ -991,24 +990,26 @@ def simulate_match(request: Request, body: SimulateRequest):
         else float("nan")
     )
 
+    if None in (h_p1_a, h_p1_b, h_p2_a, h_p2_b):
+        diff_avg_height = 0.0
+    else:
+        diff_avg_height = ((h_p1_a + h_p1_b) / 2) - ((h_p2_a + h_p2_b) / 2)
+
     features = [
-        p1_pts + p2_pts,                                                           
-        court_speed,                                                                  
-        log_diff,                                                                      
-        _f(p1.get("points_change")) - _f(p2.get("points_change")),                    
-        _f(p1.get("tournaments_played_together")) - _f(p2.get("tournaments_played_together")), 
-        _f(p1.get("matches_last_14_days")) - _f(p2.get("matches_last_14_days")),      
-        _f(p1.get("finals_conversion_rate")) - _f(p2.get("finals_conversion_rate")),  
-        _f(p1.get("win_pct")) - _f(p2.get("win_pct")),                                
-        _f(p1.get("avg_games_conceded_per_set")) - _f(p2.get("avg_games_conceded_per_set")),  
-        _f(p1.get("tie_break_win_pct")) - _f(p2.get("tie_break_win_pct")),                      
-        _f(p1.get("comeback_rate")) - _f(p2.get("comeback_rate")),                   
-        diff_avg_height,                                                               
+        p1_pts + p2_pts,
+        court_speed,
+        log_diff,
+        _f(p1.get("points_change")) - _f(p2.get("points_change")),
+        _f(p1.get("tournaments_played_together")) - _f(p2.get("tournaments_played_together")),
+        _f(p1.get("matches_last_14_days")) - _f(p2.get("matches_last_14_days")),
+        _f0(p1.get("finals_conversion_rate")) - _f0(p2.get("finals_conversion_rate")),
+        _f0(p1.get("win_pct")) - _f0(p2.get("win_pct")),
+        _f0(p1.get("avg_games_conceded_per_set")) - _f0(p2.get("avg_games_conceded_per_set")),
+        _f0(p1.get("tie_break_win_pct")) - _f0(p2.get("tie_break_win_pct")),
+        _f0(p1.get("comeback_rate")) - _f0(p2.get("comeback_rate")),
+        diff_avg_height,
     ]
 
-    # 5. Guard: reject simulation if any feature is NaN (Logistic Regression inside
-    #    the VotingClassifier cannot handle missing values).
-    
     if any(math.isnan(f) for f in features):
         raise HTTPException(
             status_code=422,
@@ -1036,7 +1037,6 @@ def simulate_match(request: Request, body: SimulateRequest):
     ]
     model = _get_model()
     X = pd.DataFrame([features], columns=_MODEL_COLUMNS)
-
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(X)[0]
         # Class 1 = pair1 wins, class 0 = pair2 wins
