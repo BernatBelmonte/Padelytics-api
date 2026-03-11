@@ -855,18 +855,13 @@ def global_search(
 
 
 # ─── AI / Match Simulation ────────────────────────────────────────────────────
-
-# Cached model – downloaded once from Supabase Storage on first call.
 _model_cache = None
-
 
 def _get_model():
     """Download and cache the padel prediction model from Supabase Storage."""
     global _model_cache
     if _model_cache is None:
         model_bytes = supabase.storage.from_("models").download("final_padel_model.pkl")
-        # Suppress the XGBoost serialisation-version mismatch UserWarning;
-        # the model loads and predicts correctly despite the older pickle format.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
             _model_cache = joblib.load(io.BytesIO(model_bytes))
@@ -902,12 +897,6 @@ def _calculate_smart_speed_index(
 
     return 50.0 + altitude_score + final_temp_score - final_hum_penalty + indoor_bonus
 
-
-def _nan_to_none(v: float):
-    """Convert float NaN to None for JSON serialisation."""
-    return None if (v is None or math.isnan(v)) else v
-
-
 class SimulateRequest(BaseModel):
     pair1_slug: str = Field(..., min_length=1, max_length=100, pattern=_SLUG_PATTERN)
     pair2_slug: str = Field(..., min_length=1, max_length=100, pattern=_SLUG_PATTERN)
@@ -936,7 +925,6 @@ def simulate_match(request: Request, body: SimulateRequest):
 
     **Response**: win probabilities and predicted winner from pair1's perspective.
     """
-    # 1. Fetch latest dynamic_pairs snapshot for both pairs
     p1_res = (
         supabase.table("dynamic_pairs")
         .select("*")
@@ -989,7 +977,7 @@ def simulate_match(request: Request, body: SimulateRequest):
         body.venue_type, body.altitude, body.avg_temperature, body.avg_humidity
     )
 
-    # 4. Build feature vector (order must match EXPECTED_FEATURES)
+    # 4. Build feature vector
     def _f(val):
         """Return float, or NaN if None."""
         return float("nan") if val is None else float(val)
@@ -1004,42 +992,24 @@ def simulate_match(request: Request, body: SimulateRequest):
     )
 
     features = [
-        p1_pts + p2_pts,                                                              # match_quality_sum
-        court_speed,                                                                   # court_speed_index
-        log_diff,                                                                      # diff_log_total_points
-        _f(p1.get("points_change")) - _f(p2.get("points_change")),                    # diff_points_change
-        _f(p1.get("tournaments_played_together")) - _f(p2.get("tournaments_played_together")),  # diff_tournaments_played_together
-        _f(p1.get("matches_last_14_days")) - _f(p2.get("matches_last_14_days")),      # diff_matches_last_14_days
-        _f(p1.get("finals_conversion_rate")) - _f(p2.get("finals_conversion_rate")),  # diff_finals_conversion_rate
-        _f(p1.get("win_pct")) - _f(p2.get("win_pct")),                                # diff_season_win_pct
-        _f(p1.get("avg_games_conceded_per_set")) - _f(p2.get("avg_games_conceded_per_set")),  # diff_avg_games_conceded_per_set
-        _f(p1.get("tie_break_win_pct")) - _f(p2.get("tie_break_win_pct")),            # diff_tie_break_win_pct
-        _f(p1.get("comeback_rate")) - _f(p2.get("comeback_rate")),                    # diff_comeback_rate
-        diff_avg_height,                                                               # diff_avg_height
+        p1_pts + p2_pts,                                                           
+        court_speed,                                                                  
+        log_diff,                                                                      
+        _f(p1.get("points_change")) - _f(p2.get("points_change")),                    
+        _f(p1.get("tournaments_played_together")) - _f(p2.get("tournaments_played_together")), 
+        _f(p1.get("matches_last_14_days")) - _f(p2.get("matches_last_14_days")),      
+        _f(p1.get("finals_conversion_rate")) - _f(p2.get("finals_conversion_rate")),  
+        _f(p1.get("win_pct")) - _f(p2.get("win_pct")),                                
+        _f(p1.get("avg_games_conceded_per_set")) - _f(p2.get("avg_games_conceded_per_set")),  
+        _f(p1.get("tie_break_win_pct")) - _f(p2.get("tie_break_win_pct")),                      
+        _f(p1.get("comeback_rate")) - _f(p2.get("comeback_rate")),                   
+        diff_avg_height,                                                               
     ]
 
     # 5. Guard: reject simulation if any feature is NaN (Logistic Regression inside
     #    the VotingClassifier cannot handle missing values).
-    _FEATURE_NAMES = [
-        "match_quality_sum (points)",
-        "court_speed_index",
-        "diff_log_total_points (points)",
-        "diff_points_change",
-        "diff_tournaments_played_together",
-        "diff_matches_last_14_days",
-        "diff_finals_conversion_rate",
-        "diff_season_win_pct",
-        "diff_avg_games_conceded_per_set",
-        "diff_tie_break_win_pct",
-        "diff_comeback_rate",
-        "diff_avg_height",
-    ]
-    missing_fields = [
-        _FEATURE_NAMES[i]
-        for i, v in enumerate(features)
-        if math.isnan(v)
-    ]
-    if missing_fields:
+    
+    if any(math.isnan(f) for f in features):
         raise HTTPException(
             status_code=422,
             detail={
@@ -1047,11 +1017,9 @@ def simulate_match(request: Request, body: SimulateRequest):
                     "Simulation could not be completed due to insufficient data. "
                     "One or more required statistics are missing for the selected pairs."
                 ),
-                "missing_fields": missing_fields,
             },
         )
 
-    # 6. Load model (cached) and predict
     _MODEL_COLUMNS = [
         "match_quality_sum",
         "court_speed_index",
@@ -1067,8 +1035,6 @@ def simulate_match(request: Request, body: SimulateRequest):
         "diff_avg_height",
     ]
     model = _get_model()
-    # Pass a named DataFrame so pipelines with StandardScaler (fitted on a
-    # DataFrame) do not raise feature-name validation warnings.
     X = pd.DataFrame([features], columns=_MODEL_COLUMNS)
 
     if hasattr(model, "predict_proba"):
@@ -1089,18 +1055,4 @@ def simulate_match(request: Request, body: SimulateRequest):
         "pair1_win_probability": pair1_win_prob,
         "pair2_win_probability": pair2_win_prob,
         "predicted_winner": predicted_winner,
-        "features_used": {
-            "match_quality_sum": _nan_to_none(features[0]),
-            "court_speed_index": round(court_speed, 4),
-            "diff_log_total_points": _nan_to_none(features[2]),
-            "diff_points_change": _nan_to_none(features[3]),
-            "diff_tournaments_played_together": _nan_to_none(features[4]),
-            "diff_matches_last_14_days": _nan_to_none(features[5]),
-            "diff_finals_conversion_rate": _nan_to_none(features[6]),
-            "diff_season_win_pct": _nan_to_none(features[7]),
-            "diff_avg_games_conceded_per_set": _nan_to_none(features[8]),
-            "diff_tie_break_win_pct": _nan_to_none(features[9]),
-            "diff_comeback_rate": _nan_to_none(features[10]),
-            "diff_avg_height": _nan_to_none(diff_avg_height),
-        },
     }
