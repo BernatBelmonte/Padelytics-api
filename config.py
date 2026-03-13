@@ -37,7 +37,10 @@ SUPABASE_KEY: str = _require("SUPABASE_KEY")
 # Comma-separated list of allowed CORS origins.
 # Example: ALLOWED_ORIGINS=https://app.example.com,https://www.example.com
 # In production NEVER leave this as "*".
-_raw_origins = _optional("ALLOWED_ORIGINS", "http://localhost:3000")
+_raw_origins = _optional(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000,https://padelytics.es,https://www.padelytics.es",
+)
 ALLOWED_ORIGINS: list[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
 
 # Application environment: "development" shows /docs; "production" hides them.
