@@ -32,6 +32,8 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from supabase import Client, ClientOptions, create_client
 
+from ai_engine import obtain_ai_analysis
+
 import config
 
 #
@@ -905,6 +907,7 @@ class SimulateRequest(BaseModel):
     altitude: float = Field(..., ge=0, le=5000)
     avg_temperature: float = Field(..., ge=-20, le=60)
     avg_humidity: float = Field(..., ge=0, le=100)
+    language: Optional[str] = Field(None)
 
 
 @app.post("/simulate", tags=["AI"])
@@ -1050,10 +1053,26 @@ def simulate_match(request: Request, body: SimulateRequest):
 
     predicted_winner = body.pair1_slug if pair1_win_prob >= 0.5 else body.pair2_slug
 
+
+    feature_dict = dict(zip(_MODEL_COLUMNS, features))
+
+    ai_data = {
+        "winner": predicted_winner,
+        "probability": max(pair1_win_prob, pair2_win_prob),
+        "altitude": body.altitude,
+        "temperature": body.avg_temperature,
+        "humidity": body.avg_humidity,
+        "features": feature_dict,
+        "language": "english" if body.language and body.language.lower().startswith("en") else "español"
+    }
+    
+    ai_analysis = obtain_ai_analysis(ai_data)
+
     return {
         "pair1_slug": body.pair1_slug,
         "pair2_slug": body.pair2_slug,
         "pair1_win_probability": pair1_win_prob,
         "pair2_win_probability": pair2_win_prob,
         "predicted_winner": predicted_winner,
+        "ai_analysis": ai_analysis
     }
